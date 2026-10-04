@@ -1,0 +1,485 @@
+#!/usr/bin/env python3
+"""Re-encode big videos to 1080p AV1 and swap them into Immich, keeping albums and metadata.
+
+  immich-shrink library [options]          replace big videos already in Immich
+  immich-shrink folder SRC DST [options]   convert a folder before you upload it
+
+library mode, per video: download the original, convert it, upload the new
+file, copy albums / favorite / shared links / stack / description onto it, and
+send the original to Immich's trash. A log makes reruns skip finished videos
+and finish any replacement that was interrupted half-way.
+
+folder mode never touches SRC: DST gets the converted videos plus everything
+else (photos, small videos) copied as-is, ready to upload.
+
+Ctrl+C stops (only the video in progress is lost); Ctrl+Z pauses, `fg` resumes.
+"""
+import argparse
+import datetime as dt
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+import urllib.request
+from pathlib import Path
+
+MAC = sys.platform == "darwin"
+CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "immich-shrink"
+CONFIG_FILE = CONFIG_DIR / "config.toml"
+LOG_FILE = CONFIG_DIR / "replaced.jsonl"
+CACHE = Path.home() / ("Library/Caches" if MAC else ".cache") / "immich-shrink"
+
+# Encoding. Measured on GoPro 2.7K/4K 60 fps footage: about -65 % size at VMAF 96
+# (see README). Frame rate, bit depth and HDR are kept as they are.
+CRF = 28
+PRESET = 8
+MAX_SHORT_SIDE = 1080      # videos taller/wider than this are converted...
+MAX_BITRATE = 20_000_000   # ...and so are 1080p ones above this bitrate
+MIN_SAVING = 0.15          # keep the original unless the new file is this much smaller
+DURATION_TOLERANCE = 0.5   # seconds
+SCALE = "scale='if(gte(iw,ih),-16,min(1080,iw))':'if(gte(iw,ih),min(1080,ih),-16)':out_range=tv"
+
+VIDEO_EXTS = {".mp4", ".mov", ".m4v", ".mts", ".m2ts", ".avi", ".mkv", ".3gp"}
+MP4_AUDIO = {"aac", "mp3", "opus", "ac3", "eac3", "alac"}
+SKIP_EXTS = {".lrv", ".thm"}  # GoPro low-res proxies and thumbnails
+SKIP_DIRS = {"@eaDir", "#recycle"}  # Synology metadata and recycle bin
+
+
+# ---------- conversion ----------
+
+def probe(path):
+    out = subprocess.run(["ffprobe", "-v", "error", "-print_format", "json",
+                          "-show_format", "-show_streams", str(path)],
+                         capture_output=True, text=True)
+    return json.loads(out.stdout or "{}")
+
+
+def video_stream(info):
+    return next((s for s in info.get("streams", []) if s.get("codec_type") == "video"
+                 and not s.get("disposition", {}).get("attached_pic")), None)
+
+
+def duration(info):
+    return float(info.get("format", {}).get("duration") or 0)
+
+
+def mp4_name(path):
+    """Output name: the original one, with an .mp4 extension if it had another."""
+    path = Path(path)
+    return path if path.suffix.lower() == ".mp4" else path.with_suffix(".mp4")
+
+
+def worth_converting(width, height, size, seconds):
+    rate = size * 8 / seconds if seconds else 0
+    return min(width, height) > MAX_SHORT_SIDE or rate > MAX_BITRATE
+
+
+def ffmpeg_command(src, dst, info, gentle):
+    """ffmpeg arguments to convert src to an AV1 mp4, keeping bit depth, HDR, date and GPS."""
+    video = video_stream(info)
+    ten_bit = "10" in (video.get("pix_fmt") or "")
+    color = []
+    for opt, key in (("-color_primaries", "color_primaries"), ("-color_trc", "color_transfer"),
+                     ("-colorspace", "color_space")):
+        if video.get(key) and video[key] != "unknown":
+            color += [opt, video[key]]
+    audio = next((s for s in info.get("streams", []) if s.get("codec_type") == "audio"), None)
+    audio_args = ["-c:a", "copy"] if not audio or audio.get("codec_name") in MP4_AUDIO \
+        else ["-c:a", "aac", "-b:a", "192k"]
+    # GoPro telemetry (GPS, gyro) is kept; other data tracks are dropped.
+    telemetry = []
+    for s in info.get("streams", []):
+        if s.get("codec_tag_string") == "gpmd":
+            telemetry += ["-map", f"0:{s['index']}"]
+    if telemetry:
+        telemetry += ["-c:d", "copy", "-tag:d", "gpmd"]
+    cmd = ["ffmpeg", "-hide_banner", "-nostdin", "-loglevel", "error", "-y",
+           *(["-hwaccel", "videotoolbox"] if MAC else []), "-i", str(src),
+           "-map", "0:v:0", "-map", "0:a?", "-map_metadata", "0",
+           "-vf", SCALE + (",format=yuv420p10le" if ten_bit else ",format=yuv420p"),
+           "-c:v", "libsvtav1", "-preset", str(PRESET), "-crf", str(CRF), "-color_range", "tv",
+           *color, *audio_args, *telemetry,
+           "-movflags", "+faststart", "-progress", "pipe:1", "-nostats", "-f", "mp4", str(dst)]
+    if gentle:
+        cmd = (["taskpolicy", "-b"] if MAC else ["nice", "-n", "19"]) + cmd
+    return cmd
+
+
+def encode(src, dst, info, gentle, label):
+    total = duration(info)
+    started = time.time()
+    proc = subprocess.Popen(ffmpeg_command(src, dst, info, gentle),
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    try:
+        for line in proc.stdout:
+            if line.startswith("out_time_us=") and total:
+                try:
+                    done = int(line.split("=")[1]) / 1e6 / total
+                except ValueError:
+                    continue
+                elapsed = time.time() - started
+                eta = elapsed / done - elapsed if done > 0.02 else 0
+                status(f"{label}  converting {min(done, 1) * 100:3.0f}%"
+                       + (f"  ~{eta / 60:.0f} min left" if eta else ""))
+        proc.wait()
+    except BaseException:
+        proc.kill()
+        proc.wait()
+        raise
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.read().strip() or f"ffmpeg exit {proc.returncode}")
+    out = probe(dst)
+    if (video_stream(out) or {}).get("codec_name") != "av1":
+        raise RuntimeError("output has no AV1 video")
+    if abs(duration(out) - total) > DURATION_TOLERANCE:
+        raise RuntimeError(f"duration mismatch: {duration(out):.2f}s vs {total:.2f}s")
+
+
+# ---------- run control ----------
+
+def status(text):
+    width = shutil.get_terminal_size((120, 20)).columns
+    print("\r" + text[:width - 1].ljust(width - 1), end="", flush=True)
+
+
+def done_line(text):
+    status(text)
+    print()
+
+
+def human(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if abs(n) < 1000:
+            return f"{n:.0f} {unit}"
+        n /= 1000
+    return f"{n:.1f} TB"
+
+
+def deadline(until, now):
+    """Next occurrence of HH:MM after now."""
+    hh, mm = map(int, until.split(":"))
+    target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+    return target if target > now else target + dt.timedelta(days=1)
+
+
+class Run:
+    def __init__(self, args):
+        self.limit = args.limit
+        self.count = 0
+        self.saved = 0
+        self.deadline = deadline(args.until, dt.datetime.now()) if args.until else None
+        if self.deadline:
+            print(f"Will not start new videos after {self.deadline:%H:%M}.")
+        if MAC:  # keep the Mac awake while this process lives
+            subprocess.Popen(["caffeinate", "-i", "-w", str(os.getpid())])
+
+    def keep_going(self):
+        if self.limit is not None and self.count >= self.limit:
+            print(f"Reached --limit {self.limit}.")
+            return False
+        if self.deadline and dt.datetime.now() >= self.deadline:
+            print(f"It is past {self.deadline:%H:%M}, stopping. Run it again to continue.")
+            return False
+        return True
+
+
+# ---------- library mode ----------
+
+def load_config(args):
+    cfg = tomllib.loads(CONFIG_FILE.read_text()) if CONFIG_FILE.exists() else {}
+    url = args.url or os.environ.get("IMMICH_URL") or cfg.get("url")
+    key = os.environ.get("IMMICH_API_KEY") or cfg.get("api_key")
+    keep = [*cfg.get("keep_albums", []), *(args.keep_album or [])]
+    if not url or not key:
+        sys.exit(f"Missing the Immich URL or API key. Put them in {CONFIG_FILE} "
+                 "or set IMMICH_URL / IMMICH_API_KEY (see README).")
+    return api_base(url), key, keep
+
+
+def api_base(url):
+    url = url.rstrip("/")
+    return url if url.endswith("/api") else url + "/api"
+
+
+def asset_seconds(asset):
+    """Asset duration in seconds: milliseconds in recent Immich, 'H:MM:SS.fff' in older ones."""
+    d = asset.get("duration")
+    if isinstance(d, (int, float)):
+        return d / 1000
+    if isinstance(d, str) and d.count(":") == 2:
+        h, m, s = d.split(":")
+        return int(h) * 3600 + int(m) * 60 + float(s)
+    return 0
+
+
+class Immich:
+    def __init__(self, base, key):
+        self.base, self.key = base, key
+
+    def call(self, method, path, body=None):
+        req = urllib.request.Request(
+            self.base + path, method=method,
+            data=json.dumps(body).encode() if body is not None else None,
+            headers={"x-api-key": self.key, "Accept": "application/json",
+                     "Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=120) as r:
+            raw = r.read()
+        return json.loads(raw) if raw else None
+
+    def videos(self, **filters):
+        items, page = [], 1
+        while page:
+            d = self.call("POST", "/search/metadata",
+                          {"type": "VIDEO", "withExif": True, "size": 1000, "page": page, **filters})
+            items += d["assets"]["items"]
+            page = int(d["assets"]["nextPage"]) if d["assets"].get("nextPage") else None
+        return items
+
+    def kept(self, names):
+        """Ids of the videos in albums whose name contains any of names."""
+        ids = set()
+        if names:
+            for album in self.call("GET", "/albums"):
+                if any(n in album["albumName"] for n in names):
+                    ids |= {a["id"] for a in self.videos(albumIds=[album["id"]])}
+        return ids
+
+    def curl(self, *args):
+        # The key goes through stdin so it never shows up in the process list.
+        out = subprocess.run(["curl", "-sS", "-f", "-H", "@-", *args],
+                             input=f"x-api-key: {self.key}\n", capture_output=True, text=True)
+        if out.returncode != 0:
+            raise RuntimeError(f"curl: {out.stderr.strip()}")
+        return out.stdout
+
+    def download(self, asset_id, dst):
+        self.curl("-o", str(dst), f"{self.base}/assets/{asset_id}/original")
+
+    def upload(self, path, old):
+        name = mp4_name(old["originalFileName"]).name
+        res = json.loads(self.curl(
+            "-F", f"assetData=@{path};filename={name}",
+            "-F", f"filename={name}",
+            "-F", f"fileCreatedAt={old['fileCreatedAt']}",
+            "-F", f"fileModifiedAt={old['fileModifiedAt']}",
+            "-F", f"visibility={old.get('visibility') or 'timeline'}",
+            f"{self.base}/assets"))
+        return res["id"]
+
+    def finish(self, old, new_id):
+        """Move everything the user added onto the new asset, then trash the old one."""
+        self.call("PUT", "/assets/copy", {"sourceId": old["id"], "targetId": new_id,
+                                          "albums": True, "favorite": True, "sharedLinks": True,
+                                          "sidecar": True, "stack": True})
+        exif = old.get("exifInfo") or {}
+        extra = {k: v for k, v in (("description", exif.get("description")),
+                                   ("rating", exif.get("rating"))) if v}
+        if extra:
+            self.call("PUT", f"/assets/{new_id}", extra)
+        self.call("DELETE", "/assets", {"ids": [old["id"]], "force": False})
+
+
+def read_log(path=LOG_FILE):
+    """Latest known state per original asset id, replaying the append-only log."""
+    state = {}
+    if path.exists():
+        for line in path.read_text().splitlines():
+            entry = json.loads(line)
+            state[entry["old"]] = {**state.get(entry["old"], {}), **entry}
+    return state
+
+
+def write_log(path=LOG_FILE, **entry):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as f:
+        f.write(json.dumps({**entry, "at": dt.datetime.now().isoformat(timespec="seconds")}) + "\n")
+
+
+def candidates(assets, state, kept):
+    """Videos worth converting that were never handled, biggest first."""
+    ours = {s.get("new") for s in state.values()}
+    todo = []
+    for a in assets:
+        exif = a.get("exifInfo") or {}
+        if a["id"] in state or a["id"] in ours or a["id"] in kept or a.get("visibility") == "hidden":
+            continue  # hidden = the motion part of a live/motion photo
+        seconds = asset_seconds(a)
+        if seconds and worth_converting(exif.get("exifImageWidth") or 0, exif.get("exifImageHeight") or 0,
+                                        exif.get("fileSizeInByte") or 0, seconds):
+            todo.append(a)
+    return sorted(todo, key=lambda a: a["exifInfo"].get("fileSizeInByte") or 0, reverse=True)
+
+
+def run_library(args):
+    base, key, keep = load_config(args)
+    api = Immich(base, key)
+    if not args.dry_run and not api.call("GET", "/server/features").get("trash"):
+        sys.exit("Immich's trash is disabled, so replaced originals would be deleted for good. "
+                 "Enable it in Administration > Settings > Trash first.")
+    state = read_log()
+    print("Reading the Immich library...")
+    assets = {a["id"]: a for a in api.videos()}
+
+    # Finish replacements interrupted after the upload.
+    for old_id, s in state.items():
+        if s["status"] == "uploaded":
+            old = assets.get(old_id) or {"id": old_id, "exifInfo": {}}
+            print(f"Finishing interrupted replacement of {s.get('name', old_id)}")
+            try:
+                api.finish(old, s["new"])
+            except Exception as e:
+                print(f"  FAILED, will retry next run: {e}")
+                continue
+            write_log(old=old_id, status="done")
+            s["status"] = "done"
+
+    todo = candidates(assets.values(), state, api.kept(keep))
+    size_of = lambda a: a["exifInfo"].get("fileSizeInByte") or 0
+    print(f"{len(todo)} videos to convert ({human(sum(map(size_of, todo)))}).")
+    if args.dry_run:
+        for a in todo[:20]:
+            print(f"  {human(size_of(a)):>7}  {a['originalFileName']}")
+        return
+
+    run = Run(args)
+    CACHE.mkdir(parents=True, exist_ok=True)
+    for i, a in enumerate(todo, 1):
+        if not run.keep_going():
+            break
+        run.count += 1
+        name = a["originalFileName"]
+        label = f"[{i}/{len(todo)}] {name}"
+        work = Path(tempfile.mkdtemp(dir=CACHE))
+        try:
+            status(f"{label}  downloading {human(size_of(a))}")
+            src = work / ("orig" + Path(name).suffix.lower())
+            api.download(a["id"], src)
+            info = probe(src)
+            if not video_stream(info) or not duration(info):
+                raise RuntimeError("not a readable video")
+            if video_stream(info).get("codec_name") == "av1":
+                write_log(old=a["id"], name=name, status="skipped", reason="already AV1")
+                done_line(f"{label}  kept: already AV1")
+                continue
+            new = work / "new.mp4"
+            encode(src, new, info, args.gentle, label)
+            before, after = src.stat().st_size, new.stat().st_size
+            if after > before * (1 - MIN_SAVING):
+                write_log(old=a["id"], name=name, status="skipped", reason="no real saving")
+                done_line(f"{label}  kept: AV1 would only save {(1 - after / before) * 100:.0f}%")
+                continue
+            status(f"{label}  uploading")
+            new_id = api.upload(new, a)
+            write_log(old=a["id"], name=name, new=new_id, status="uploaded", before=before, after=after)
+            api.finish(a, new_id)
+            write_log(old=a["id"], status="done")
+            run.saved += before - after
+            done_line(f"{label}  {human(before)} -> {human(after)} (-{(1 - after / before) * 100:.0f}%)"
+                      f"  replaced · saved so far {human(run.saved)}")
+        except KeyboardInterrupt:
+            print(f"\n\nStopped. {name} is untouched; run the same command to continue.")
+            sys.exit(130)
+        except Exception as e:
+            done_line(f"{label}  FAILED: {e}")
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+    print(f"\nSaved {human(run.saved)} this run. Originals stay in Immich's trash until it is emptied.")
+
+
+# ---------- folder mode ----------
+
+def skipped(rel):
+    return (rel.suffix.lower() in SKIP_EXTS
+            or any(part.startswith(".") or part in SKIP_DIRS for part in rel.parts))
+
+
+def run_folder(args):
+    src_root, dst_root = Path(args.src).expanduser().resolve(), Path(args.dst).expanduser().resolve()
+    if not src_root.is_dir():
+        sys.exit(f"Not a folder: {src_root}")
+    if dst_root.is_relative_to(src_root):
+        sys.exit("DST must not be inside SRC")
+    files = sorted(p.relative_to(src_root) for p in src_root.rglob("*")
+                   if p.is_file() and not skipped(p.relative_to(src_root)))
+    todo = [rel for rel in files
+            if not (dst_root / mp4_name(rel)).exists() and not (dst_root / rel).exists()]
+    print(f"{len(files)} files in {src_root}, {len(files) - len(todo)} already done, "
+          f"{len(todo)} to go. Output: {dst_root}")
+    if args.dry_run:
+        return
+    run = Run(args)
+    for i, rel in enumerate(todo, 1):
+        if not run.keep_going():
+            break
+        src = src_root / rel
+        size, label, tmp = src.stat().st_size, f"[{i}/{len(todo)}] {rel}", None
+        try:
+            converted = False
+            if rel.suffix.lower() in VIDEO_EXTS:
+                run.count += 1
+                info = probe(src)
+                video = video_stream(info)
+                if video and duration(info) and video.get("codec_name") != "av1" and worth_converting(
+                        video.get("width", 0), video.get("height", 0), size, duration(info)):
+                    dst = dst_root / mp4_name(rel)
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    tmp = dst.with_name(f".{dst.name}.part")
+                    encode(src, tmp, info, args.gentle, label)
+                    after = tmp.stat().st_size
+                    if after <= size * (1 - MIN_SAVING):
+                        os.replace(tmp, dst)
+                        os.utime(dst, (src.stat().st_atime, src.stat().st_mtime))
+                        run.saved += size - after
+                        converted = True
+                        done_line(f"{label}  {human(size)} -> {human(after)} "
+                                  f"(-{(1 - after / size) * 100:.0f}%) · saved so far {human(run.saved)}")
+                    else:
+                        tmp.unlink()
+            if not converted:
+                # Photos, small or already-AV1 videos and those AV1 cannot shrink: copied as-is.
+                dst = dst_root / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                tmp = dst.with_name(f".{dst.name}.part")
+                shutil.copy2(src, tmp)
+                os.replace(tmp, dst)
+                done_line(f"{label}  copied as-is")
+            tmp = None
+        except KeyboardInterrupt:
+            print(f"\n\nStopped at {rel}; run the same command to continue.")
+            sys.exit(130)
+        except Exception as e:
+            done_line(f"{label}  FAILED: {e}")
+        finally:
+            if tmp:
+                tmp.unlink(missing_ok=True)
+    print(f"\nSaved {human(run.saved)} this run. {src_root} is untouched.")
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    sub = ap.add_subparsers(dest="mode", required=True)
+    for name, helptext in (("library", "replace big videos already in Immich"),
+                           ("folder", "convert a folder into another one, ready to upload")):
+        p = sub.add_parser(name, help=helptext, description=helptext)
+        if name == "library":
+            p.add_argument("--url", help="Immich server URL (default: IMMICH_URL or the config file)")
+            p.add_argument("--keep-album", action="append", metavar="TEXT",
+                           help="never touch videos in albums whose name contains TEXT (repeatable)")
+        else:
+            p.add_argument("src", help="folder with the original videos (never modified)")
+            p.add_argument("dst", help="output folder; created if missing")
+        p.add_argument("--until", metavar="HH:MM", help="do not start new videos after this time")
+        p.add_argument("--gentle", action="store_true",
+                       help="low priority: slower, but you will not notice it while you work")
+        p.add_argument("--limit", type=int, help="stop after this many videos")
+        p.add_argument("--dry-run", action="store_true", help="only show what would be done")
+    args = ap.parse_args()
+    (run_library if args.mode == "library" else run_folder)(args)
+
+
+if __name__ == "__main__":
+    main()

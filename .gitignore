@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# Test media and local config (never commit an API key)
+*.mp4
+*.MP4
+*.mov
+*.MOV
+*.part
+config.toml
